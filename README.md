@@ -76,6 +76,7 @@ You can override config values at runtime for:
 - advanced config-only options:
   - `show_profiles` for per-show encode overrides
   - `safety.quarantine_failed_inputs_root` / `safety.quarantine_failed_finals_root`
+  - `safety.progress_stall_timeout_seconds` to stop a stuck ffmpeg process (set `0` to disable)
   - `jellyfin.enabled`, `jellyfin.base_url`, `jellyfin.api_key`
 
 ## Logs and State
@@ -84,6 +85,7 @@ You can override config values at runtime for:
 - State DB default: `output_root/.av1-encode-state.sqlite`
 - Per-file statuses: `pending`, `encoding`, `verifying`, `done`, `failed`, `skipped`
 - Startup recovery: lingering temp files are removed and `encoding`/`verifying` rows are reset to `pending`
+- If ffmpeg stops making progress for too long, LibriEncode aborts that encode attempt and records a clear stall error.
 - End summary includes top failure reasons
 - End summary also includes quarantine counts and Jellyfin refresh status
 

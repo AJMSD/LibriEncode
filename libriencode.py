@@ -49,6 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "delete_bad_final": False,
         "temp_suffix": ".tmp",
         "delete_leftover_temp_on_start": True,
+        "progress_stall_timeout_seconds": 300,
         "quarantine_failed_inputs_root": None,
         "quarantine_failed_finals_root": None,
         "min_output_bytes": 5000000,
@@ -268,6 +269,8 @@ def normalize_config(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]
     normalized["safety"]["delete_leftover_temp_on_start"] = bool(
         normalized["safety"].get("delete_leftover_temp_on_start", True)
     )
+    stall_timeout = int(normalized["safety"].get("progress_stall_timeout_seconds", 300))
+    normalized["safety"]["progress_stall_timeout_seconds"] = stall_timeout if stall_timeout >= 0 else 0
     quarantine_inputs = normalized["safety"].get("quarantine_failed_inputs_root")
     quarantine_finals = normalized["safety"].get("quarantine_failed_finals_root")
     normalized["safety"]["quarantine_failed_inputs_root"] = (
@@ -1104,6 +1107,23 @@ def parse_ffmpeg_clock(value: str | None) -> float | None:
     return total if total >= 0 else None
 
 
+def parse_ffmpeg_progress_seconds(progress_state: dict[str, str]) -> float | None:
+    out_seconds = parse_ffmpeg_clock(progress_state.get("out_time"))
+    if out_seconds is not None:
+        return out_seconds
+    for key in ("out_time_ms", "out_time_us"):
+        raw_value = progress_state.get(key)
+        if raw_value is None:
+            continue
+        try:
+            micros = int(raw_value)
+        except ValueError:
+            continue
+        if micros >= 0:
+            return micros / 1_000_000.0
+    return None
+
+
 def format_clock(seconds: float) -> str:
     total = max(0, int(seconds))
     hours = total // 3600
@@ -1123,6 +1143,7 @@ def run_ffmpeg_with_progress(
     cmd: list[str],
     *,
     input_duration: float | None,
+    progress_stall_timeout_seconds: int,
     job_index: int,
     total_jobs: int,
     logger: logging.Logger,
@@ -1132,6 +1153,10 @@ def run_ffmpeg_with_progress(
     progress_state: dict[str, str] = {}
     non_progress_lines: list[str] = []
     last_log_time = 0.0
+    last_progress_advance_time = time.monotonic()
+    last_out_seconds: float | None = None
+    last_frame: str | None = None
+    last_total_size: str | None = None
 
     proc = subprocess.Popen(
         cmd,
@@ -1155,21 +1180,87 @@ def run_ffmpeg_with_progress(
 
             if key == "progress":
                 now = time.monotonic()
+                out_seconds = parse_ffmpeg_progress_seconds(progress_state)
+                speed = progress_state.get("speed", "?")
+                frame = progress_state.get("frame")
+                total_size = progress_state.get("total_size")
+                progressed = False
+                if out_seconds is not None:
+                    if last_out_seconds is None or out_seconds > last_out_seconds + 0.0001:
+                        progressed = True
+                    last_out_seconds = out_seconds
+                if frame is not None:
+                    if frame != last_frame:
+                        progressed = True
+                    last_frame = frame
+                if total_size is not None:
+                    if total_size != last_total_size:
+                        progressed = True
+                    last_total_size = total_size
+                if value == "end":
+                    progressed = True
+                if progressed:
+                    last_progress_advance_time = now
+                idle_seconds = now - last_progress_advance_time
+                if (
+                    progress_stall_timeout_seconds > 0
+                    and value == "continue"
+                    and idle_seconds >= progress_stall_timeout_seconds
+                ):
+                    detail = (
+                        "ffmpeg progress stalled for "
+                        f"{int(idle_seconds)}s "
+                        f"(last_out_time={progress_state.get('out_time', '?')}, speed={speed})"
+                    )
+                    logger.warning("[%d/%d] %s", job_index, total_jobs, detail)
+                    events.emit(
+                        level="warning",
+                        stage="encoding_progress",
+                        message="ffmpeg_stall_timeout",
+                        input=row["input_path"],
+                        job_index=job_index,
+                        total_jobs=total_jobs,
+                        idle_seconds=int(idle_seconds),
+                        stall_timeout_seconds=progress_stall_timeout_seconds,
+                        speed=speed,
+                        last_out_time=progress_state.get("out_time"),
+                    )
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    returncode = proc.returncode if proc.returncode is not None else 124
+                    if returncode == 0:
+                        returncode = 124
+                    detail_lines = non_progress_lines[-40:]
+                    detail_lines.append(detail)
+                    return returncode, "\n".join(detail_lines).strip()
+
                 should_log = value == "end" or (value == "continue" and (now - last_log_time) >= 5.0)
                 if not should_log:
                     continue
                 last_log_time = now
 
-                out_seconds = parse_ffmpeg_clock(progress_state.get("out_time"))
-                speed = progress_state.get("speed", "?")
-                if input_duration is not None and out_seconds is not None and input_duration > 0:
-                    pct = min(100.0, max(0.0, (out_seconds / input_duration) * 100.0))
+                display_out_seconds = out_seconds if out_seconds is not None else last_out_seconds
+                if input_duration is not None and display_out_seconds is not None and input_duration > 0:
+                    pct = min(100.0, max(0.0, (display_out_seconds / input_duration) * 100.0))
                     logger.info(
                         "[%d/%d] ffmpeg %.1f%% (%s/%s) speed %s",
                         job_index,
                         total_jobs,
                         pct,
-                        format_clock(out_seconds),
+                        format_clock(display_out_seconds),
                         format_clock(input_duration),
                         speed,
                     )
@@ -1183,12 +1274,12 @@ def run_ffmpeg_with_progress(
                         progress_pct=round(pct, 2),
                         speed=speed,
                     )
-                elif out_seconds is not None:
+                elif display_out_seconds is not None:
                     logger.info(
                         "[%d/%d] ffmpeg encoded %s speed %s",
                         job_index,
                         total_jobs,
-                        format_clock(out_seconds),
+                        format_clock(display_out_seconds),
                         speed,
                     )
                     events.emit(
@@ -1198,7 +1289,7 @@ def run_ffmpeg_with_progress(
                         input=row["input_path"],
                         job_index=job_index,
                         total_jobs=total_jobs,
-                        encoded_time=format_clock(out_seconds),
+                        encoded_time=format_clock(display_out_seconds),
                         speed=speed,
                     )
                 else:
@@ -1377,6 +1468,7 @@ def run_encode_for_job(
     returncode, ffmpeg_output = run_ffmpeg_with_progress(
         cmd,
         input_duration=input_duration,
+        progress_stall_timeout_seconds=int(config["safety"]["progress_stall_timeout_seconds"]),
         job_index=job_index,
         total_jobs=total_jobs,
         logger=logger,

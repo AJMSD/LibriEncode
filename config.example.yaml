@@ -21,6 +21,7 @@ safety:
   delete_bad_final: false
   temp_suffix: ".tmp"
   delete_leftover_temp_on_start: true
+  progress_stall_timeout_seconds: 300
   quarantine_failed_inputs_root: null   # example: "./data/quarantine/input"
   quarantine_failed_finals_root: null   # example: "./data/quarantine/final"
   min_output_bytes: 5000000
