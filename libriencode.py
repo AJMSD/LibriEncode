@@ -1003,6 +1003,11 @@ def build_ffmpeg_command(encoding: dict[str, Any], input_path: Path, temp_output
     cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
         "-y",
         "-i",
         str(input_path),
@@ -1067,6 +1072,139 @@ def parse_duration_seconds(probe: dict[str, Any]) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+def parse_ffmpeg_clock(value: str | None) -> float | None:
+    if not value:
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return None
+    total = (hours * 3600) + (minutes * 60) + seconds
+    return total if total >= 0 else None
+
+
+def format_clock(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def get_input_duration_seconds(input_path: Path) -> float | None:
+    probe_json, _ = run_ffprobe(input_path)
+    if probe_json is None:
+        return None
+    return parse_duration_seconds(probe_json)
+
+
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    *,
+    input_duration: float | None,
+    job_index: int,
+    total_jobs: int,
+    logger: logging.Logger,
+    events: JsonlLogger,
+    row: sqlite3.Row,
+) -> tuple[int, str]:
+    progress_state: dict[str, str] = {}
+    non_progress_lines: list[str] = []
+    last_log_time = 0.0
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        universal_newlines=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=" in line:
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                progress_state[key] = value
+
+            if key == "progress":
+                now = time.monotonic()
+                should_log = value == "end" or (value == "continue" and (now - last_log_time) >= 5.0)
+                if not should_log:
+                    continue
+                last_log_time = now
+
+                out_seconds = parse_ffmpeg_clock(progress_state.get("out_time"))
+                speed = progress_state.get("speed", "?")
+                if input_duration is not None and out_seconds is not None and input_duration > 0:
+                    pct = min(100.0, max(0.0, (out_seconds / input_duration) * 100.0))
+                    logger.info(
+                        "[%d/%d] ffmpeg %.1f%% (%s/%s) speed %s",
+                        job_index,
+                        total_jobs,
+                        pct,
+                        format_clock(out_seconds),
+                        format_clock(input_duration),
+                        speed,
+                    )
+                    events.emit(
+                        level="info",
+                        stage="encoding_progress",
+                        message="ffmpeg_progress",
+                        input=row["input_path"],
+                        job_index=job_index,
+                        total_jobs=total_jobs,
+                        progress_pct=round(pct, 2),
+                        speed=speed,
+                    )
+                elif out_seconds is not None:
+                    logger.info(
+                        "[%d/%d] ffmpeg encoded %s speed %s",
+                        job_index,
+                        total_jobs,
+                        format_clock(out_seconds),
+                        speed,
+                    )
+                    events.emit(
+                        level="info",
+                        stage="encoding_progress",
+                        message="ffmpeg_progress",
+                        input=row["input_path"],
+                        job_index=job_index,
+                        total_jobs=total_jobs,
+                        encoded_time=format_clock(out_seconds),
+                        speed=speed,
+                    )
+                else:
+                    logger.info("[%d/%d] ffmpeg running speed %s", job_index, total_jobs, speed)
+                    events.emit(
+                        level="info",
+                        stage="encoding_progress",
+                        message="ffmpeg_progress",
+                        input=row["input_path"],
+                        job_index=job_index,
+                        total_jobs=total_jobs,
+                        speed=speed,
+                    )
+                continue
+
+        non_progress_lines.append(line)
+
+    returncode = proc.wait()
+    detail = "\n".join(non_progress_lines[-40:]).strip()
+    return returncode, detail
 
 
 def verify_output(
@@ -1181,6 +1319,8 @@ def run_encode_for_job(
     conn: sqlite3.Connection,
     config: dict[str, Any],
     row: sqlite3.Row,
+    job_index: int,
+    total_jobs: int,
     summary: Summary,
     logger: logging.Logger,
     events: JsonlLogger,
@@ -1202,8 +1342,14 @@ def run_encode_for_job(
         row["input_path"],
         {"status": "encoding", "started_at": utc_now(), "last_error": None},
     )
+    input_duration = get_input_duration_seconds(input_path)
     cmd = build_ffmpeg_command(encoding, input_path, temp_path)
-    logger.info("Encoding: %s", input_path)
+    logger.info(
+        "[%d/%d] Encoding started: %s",
+        job_index,
+        total_jobs,
+        input_path,
+    )
     events.emit(
         level="info",
         stage="encoding",
@@ -1211,13 +1357,23 @@ def run_encode_for_job(
         input=row["input_path"],
         show=row["show_name"],
         profile=matched_profile,
+        job_index=job_index,
+        total_jobs=total_jobs,
     )
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0 or not temp_path.exists():
-        detail = proc.stderr.strip() or proc.stdout.strip() or f"ffmpeg exit code {proc.returncode}"
+    returncode, ffmpeg_output = run_ffmpeg_with_progress(
+        cmd,
+        input_duration=input_duration,
+        job_index=job_index,
+        total_jobs=total_jobs,
+        logger=logger,
+        events=events,
+        row=row,
+    )
+    if returncode != 0 or not temp_path.exists():
+        detail = ffmpeg_output or f"ffmpeg exit code {returncode}"
         mark_job_failed(conn, row["input_path"], f"encode failed: {detail}")
         summary.failed += 1
-        logger.warning("Encode failed for %s: %s", input_path, detail)
+        logger.warning("[%d/%d] Encode failed for %s: %s", job_index, total_jobs, input_path, detail)
         quarantine_file(
             input_path,
             config["safety"].get("quarantine_failed_inputs_root"),
@@ -1235,7 +1391,7 @@ def run_encode_for_job(
     if not valid_temp:
         mark_job_failed(conn, row["input_path"], f"temp verification failed: {temp_error}")
         summary.failed += 1
-        logger.warning("Temp verification failed for %s: %s", temp_path, temp_error)
+        logger.warning("[%d/%d] Temp verification failed for %s: %s", job_index, total_jobs, temp_path, temp_error)
         temp_path.unlink(missing_ok=True)
         return
 
@@ -1244,7 +1400,7 @@ def run_encode_for_job(
     if not valid_final:
         mark_job_failed(conn, row["input_path"], f"final verification failed: {final_error}")
         summary.failed += 1
-        logger.warning("Final verification failed for %s: %s", final_path, final_error)
+        logger.warning("[%d/%d] Final verification failed for %s: %s", job_index, total_jobs, final_path, final_error)
         if config["safety"]["delete_bad_final"]:
             final_path.unlink(missing_ok=True)
         else:
@@ -1261,7 +1417,15 @@ def run_encode_for_job(
 
     mark_job_done(conn, row["input_path"], final_size, probe_json)
     summary.done += 1
-    logger.info("Completed: %s -> %s", input_path, final_path)
+    logger.info(
+        "[%d/%d] Completed: %s -> %s | encoded this run: %d/%d",
+        job_index,
+        total_jobs,
+        input_path,
+        final_path,
+        summary.done,
+        total_jobs,
+    )
     try:
         input_path.unlink()
         summary.deleted_originals += 1
@@ -1279,10 +1443,11 @@ def process_jobs(
     events: JsonlLogger,
 ) -> None:
     max_attempts = int(config["safety"]["max_attempts"])
+    total_jobs = len(jobs)
     if int(config["encoding"]["concurrency"]) > 1:
         logger.info("Concurrency %d requested; current runner executes sequentially.", int(config["encoding"]["concurrency"]))
 
-    for job in jobs:
+    for job_index, job in enumerate(jobs, start=1):
         row = fetch_job_row(conn, job.input_path)
         if row is None:
             summary.skipped += 1
@@ -1320,9 +1485,15 @@ def process_jobs(
         attempts = int(row["attempt_count"] or 0)
         if row["status"] == "failed" and attempts >= max_attempts:
             summary.skipped += 1
-            logger.warning("Max attempts reached (%d), skipping: %s", max_attempts, row["input_path"])
+            logger.warning(
+                "[%d/%d] Max attempts reached (%d), skipping: %s",
+                job_index,
+                total_jobs,
+                max_attempts,
+                row["input_path"],
+            )
             continue
-        run_encode_for_job(conn, config, row, summary, logger, events)
+        run_encode_for_job(conn, config, row, job_index, total_jobs, summary, logger, events)
 
 
 def print_summary(summary: Summary, logger: logging.Logger, events: JsonlLogger) -> None:

@@ -12,14 +12,6 @@ LibriEncode is a safety-first tool that prepares your TV episodes for AV1 encodi
 - Apply optional per-show encoding profiles for tuned quality/bitrate per series.
 - Optionally quarantine failed inputs/finals and optionally trigger Jellyfin refresh after successful runs.
 
-Phase 4 adds per-show profiles, optional quarantine, and optional Jellyfin refresh trigger.
-
-## Current Progress
-- Phase 1: Completed on `2026-02-18`
-- Phase 2: Completed on `2026-02-18`
-- Phase 3: Completed on `2026-02-18`
-- Phase 4: Completed on `2026-02-18`
-
 ## Simple Project Layout
 - `libriencode.py`: main script (single-file implementation)
 - `config.example.yaml`: example configuration
@@ -81,7 +73,7 @@ You can override config values at runtime for:
 - logging: `--log-path`, `--json-logs`
 - encoding knobs (stored in profile hash for state): `--crf`, `--preset`, `--tenbit`, `--no-tenbit`, `--audio`, `--audio-bitrate`, `--container`, `--concurrency`
 - safety: `--max-attempts`, `--delete-bad-final`
-- phase 4 config-only options:
+- advanced config-only options:
   - `show_profiles` for per-show encode overrides
   - `safety.quarantine_failed_inputs_root` / `safety.quarantine_failed_finals_root`
   - `jellyfin.enabled`, `jellyfin.base_url`, `jellyfin.api_key`
