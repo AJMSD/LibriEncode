@@ -83,6 +83,7 @@ SEASON_NUMBER_RE = re.compile(r"season\s*(\d{1,2})", re.IGNORECASE)
 SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
 EPISODE_RE = re.compile(r"(?:episode|ep)\s*[-_. ]*(\d{1,3})", re.IGNORECASE)
 DASH_NUMBER_RE = re.compile(r"(?:^|[\s_.-])-\s*(\d{1,3})(?:[\s_.-]|$)")
+NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 
 
 @dataclass(frozen=True)
@@ -552,6 +553,19 @@ def sanitize_component(value: str) -> str:
     return translated or "unnamed"
 
 
+def natural_sort_key(value: str) -> list[tuple[int, Any]]:
+    parts = NATURAL_SPLIT_RE.split(value)
+    key: list[tuple[int, Any]] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return key
+
+
 def parse_season_number(season_name: str) -> int | None:
     match = SEASON_NUMBER_RE.search(season_name)
     if not match:
@@ -588,7 +602,7 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
     temp_suffix = config["safety"]["temp_suffix"]
     planned: list[PlannedJob] = []
 
-    show_dirs = [p for p in sorted(input_root.iterdir(), key=lambda x: x.name.lower()) if p.is_dir()]
+    show_dirs = [p for p in sorted(input_root.iterdir(), key=lambda x: natural_sort_key(x.name)) if p.is_dir()]
     for show_dir in show_dirs:
         show_name = show_dir.name
         show_encoding, matched_profile = resolve_encoding_for_show(config, show_name)
@@ -604,14 +618,14 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
             )
         season_dirs = [
             p
-            for p in sorted(show_dir.iterdir(), key=lambda x: x.name.lower())
+            for p in sorted(show_dir.iterdir(), key=lambda x: natural_sort_key(x.name))
             if p.is_dir() and fnmatch.fnmatch(p.name, season_glob)
         ]
         for season_dir in season_dirs:
             season_name = season_dir.name
             files = [
                 p
-                for p in sorted(season_dir.iterdir(), key=lambda x: x.name.lower())
+                for p in sorted(season_dir.iterdir(), key=lambda x: natural_sort_key(x.name))
                 if p.is_file() and p.suffix.lower() in extension_set
             ]
             for source in files:
