@@ -160,7 +160,7 @@ class JsonlLogger:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="libriencode",
-        description="Safe AV1 library encoder (Phase 4).",
+        description="Safe AV1 library encoder.",
     )
     parser.add_argument("--config", type=str, help="Path to YAML config file.")
     parser.add_argument("--input-root", type=str)
@@ -1644,7 +1644,7 @@ def main() -> int:
     logger, events = build_loggers(config)
     summary = Summary()
     try:
-        logger.info("Starting LibriEncode Phase 4 run")
+        logger.info("Starting LibriEncode")
         events.emit(level="info", stage="startup", message="run_start", dry_run=config["dry_run"])
         if not check_binaries(config["dry_run"], logger, events):
             return 3

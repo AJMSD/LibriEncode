@@ -2,7 +2,7 @@
 
 LibriEncode is a safety-first tool that prepares your TV episodes for AV1 encoding and organizes outputs for Jellyfin.
 
-## Goal (Plain English)
+## Goal
 - Take episodes from an `_incoming` folder.
 - Plan where each encoded file should go in your library.
 - Track progress in a local SQLite database so reruns are safe.
@@ -97,6 +97,3 @@ You can override config values at runtime for:
 - Empty staging season/show folders are removed only when actually empty.
 - Optional quarantine moves failed inputs/finals into configured quarantine roots.
 - `--dry-run` avoids persistent writes.
-
-## Next
-Future work can focus on metadata integration and metrics/status endpoint.
