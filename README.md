@@ -9,13 +9,16 @@ LibriEncode is a safety-first tool that prepares your TV episodes for AV1 encodi
 - Encode to AV1, verify output, and only then delete originals.
 - Recover cleanly after interruptions by resetting in-progress jobs and removing leftover temp files.
 - Remove empty staging season/show folders after successful processing.
+- Apply optional per-show encoding profiles for tuned quality/bitrate per series.
+- Optionally quarantine failed inputs/finals and optionally trigger Jellyfin refresh after successful runs.
 
-Phase 3 adds startup recovery, empty folder cleanup, and stronger end-of-run reporting.
+Phase 4 adds per-show profiles, optional quarantine, and optional Jellyfin refresh trigger.
 
 ## Current Progress
 - Phase 1: Completed on `2026-02-18`
 - Phase 2: Completed on `2026-02-18`
 - Phase 3: Completed on `2026-02-18`
+- Phase 4: Completed on `2026-02-18`
 
 ## Simple Project Layout
 - `libriencode.py`: main script (single-file implementation)
@@ -78,6 +81,10 @@ You can override config values at runtime for:
 - logging: `--log-path`, `--json-logs`
 - encoding knobs (stored in profile hash for state): `--crf`, `--preset`, `--tenbit`, `--no-tenbit`, `--audio`, `--audio-bitrate`, `--container`, `--concurrency`
 - safety: `--max-attempts`, `--delete-bad-final`
+- phase 4 config-only options:
+  - `show_profiles` for per-show encode overrides
+  - `safety.quarantine_failed_inputs_root` / `safety.quarantine_failed_finals_root`
+  - `jellyfin.enabled`, `jellyfin.base_url`, `jellyfin.api_key`
 
 ## Logs and State
 - Human logs: console + optional file (`logging.log_path`)
@@ -86,6 +93,7 @@ You can override config values at runtime for:
 - Per-file statuses: `pending`, `encoding`, `verifying`, `done`, `failed`, `skipped`
 - Startup recovery: lingering temp files are removed and `encoding`/`verifying` rows are reset to `pending`
 - End summary includes top failure reasons
+- End summary also includes quarantine counts and Jellyfin refresh status
 
 ## Safety Notes
 - Source files are deleted only after successful encode + verify + state commit.
@@ -93,7 +101,8 @@ You can override config values at runtime for:
 - Existing final files are reconciled before re-encoding.
 - Corrupt files are marked failed and kept in staging.
 - Empty staging season/show folders are removed only when actually empty.
+- Optional quarantine moves failed inputs/finals into configured quarantine roots.
 - `--dry-run` avoids persistent writes.
 
 ## Next
-Future work can focus on metrics, scheduling docs, and optional metadata enhancements.
+Future work can focus on metadata integration and metrics/status endpoint.
