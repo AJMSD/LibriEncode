@@ -1,0 +1,34 @@
+input_root: "A:/mnt/Extreme500/Anime/_incoming"
+output_root: "A:/mnt/Extreme500/Anime"
+state_db: "A:/mnt/Extreme500/Anime/.av1-encode-state.sqlite"
+
+scan:
+  season_folder_glob: "Season *"
+  extensions: [".mkv", ".mp4", ".avi", ".mov", ".webm"]
+
+encoding:
+  codec: "libsvtav1"
+  crf: 28
+  preset: 6
+  ten_bit: true
+  container: "mkv"
+  audio_codec: "opus"
+  audio_bitrate_kbps: 128
+  concurrency: 1
+
+safety:
+  max_attempts: 3
+  delete_bad_final: false
+  temp_suffix: ".tmp"
+  min_output_bytes: 5000000
+  duration_tolerance_seconds: 3.0
+
+roots:
+  on_missing_root: "retry" # retry | skip | fail
+  retry_seconds: 10
+  retry_count: 30
+
+logging:
+  log_path: "./logs/av1-encode.log"
+  json_logs: true
+  level: "info"
