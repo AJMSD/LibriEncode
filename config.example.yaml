@@ -21,8 +21,27 @@ safety:
   delete_bad_final: false
   temp_suffix: ".tmp"
   delete_leftover_temp_on_start: true
+  quarantine_failed_inputs_root: null   # example: "./data/quarantine/input"
+  quarantine_failed_finals_root: null   # example: "./data/quarantine/final"
   min_output_bytes: 5000000
   duration_tolerance_seconds: 3.0
+
+show_profiles:
+  - match: "ShowName*"
+    encoding:
+      crf: 30
+      preset: 7
+      ten_bit: true
+      audio_codec: "opus"
+      audio_bitrate_kbps: 96
+
+jellyfin:
+  enabled: false
+  base_url: "http://localhost:8096"
+  api_key: ""
+  refresh_after_run: true
+  min_done_to_refresh: 1
+  timeout_seconds: 10
 
 roots:
   on_missing_root: "retry" # retry | skip | fail

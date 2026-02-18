@@ -13,6 +13,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,8 +49,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "delete_bad_final": False,
         "temp_suffix": ".tmp",
         "delete_leftover_temp_on_start": True,
+        "quarantine_failed_inputs_root": None,
+        "quarantine_failed_finals_root": None,
         "min_output_bytes": 5000000,
         "duration_tolerance_seconds": 3.0,
+    },
+    "show_profiles": [],
+    "jellyfin": {
+        "enabled": False,
+        "base_url": "",
+        "api_key": "",
+        "refresh_after_run": True,
+        "min_done_to_refresh": 1,
+        "timeout_seconds": 10,
     },
     "roots": {
         "on_missing_root": "retry",
@@ -79,6 +92,7 @@ class PlannedJob:
     season_name: str
     output_final_path: str
     output_temp_path: str
+    ffmpeg_profile_hash: str
     input_size_bytes: int
     input_mtime: float
 
@@ -94,9 +108,13 @@ class Summary:
     skipped: int = 0
     failed: int = 0
     deleted_originals: int = 0
+    quarantined_inputs: int = 0
+    quarantined_finals: int = 0
     deleted_season_folders: int = 0
     deleted_show_folders: int = 0
     top_failure_reasons: list[tuple[str, int]] | None = None
+    jellyfin_refresh_attempted: bool = False
+    jellyfin_refresh_success: bool = False
 
 
 class JsonlLogger:
@@ -140,7 +158,7 @@ class JsonlLogger:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="libriencode",
-        description="Safe AV1 library encoder (Phase 3).",
+        description="Safe AV1 library encoder (Phase 4).",
     )
     parser.add_argument("--config", type=str, help="Path to YAML config file.")
     parser.add_argument("--input-root", type=str)
@@ -249,10 +267,56 @@ def normalize_config(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]
     normalized["safety"]["delete_leftover_temp_on_start"] = bool(
         normalized["safety"].get("delete_leftover_temp_on_start", True)
     )
+    quarantine_inputs = normalized["safety"].get("quarantine_failed_inputs_root")
+    quarantine_finals = normalized["safety"].get("quarantine_failed_finals_root")
+    normalized["safety"]["quarantine_failed_inputs_root"] = (
+        str(Path(quarantine_inputs)) if quarantine_inputs else None
+    )
+    normalized["safety"]["quarantine_failed_finals_root"] = (
+        str(Path(quarantine_finals)) if quarantine_finals else None
+    )
     normalized["safety"]["min_output_bytes"] = int(normalized["safety"].get("min_output_bytes", 5000000))
     normalized["safety"]["duration_tolerance_seconds"] = float(
         normalized["safety"].get("duration_tolerance_seconds", 3.0)
     )
+
+    raw_profiles = normalized.get("show_profiles") or []
+    normalized_profiles: list[dict[str, Any]] = []
+    if isinstance(raw_profiles, list):
+        for profile in raw_profiles:
+            if not isinstance(profile, dict):
+                continue
+            match = str(profile.get("match", "")).strip()
+            if not match:
+                continue
+            enc = profile.get("encoding", {})
+            if not isinstance(enc, dict):
+                enc = {}
+            normalized_profiles.append(
+                {
+                    "match": match,
+                    "encoding": {
+                        "crf": enc.get("crf"),
+                        "preset": enc.get("preset"),
+                        "ten_bit": enc.get("ten_bit"),
+                        "audio_codec": str(enc.get("audio_codec", "")).lower() if enc.get("audio_codec") is not None else None,
+                        "audio_bitrate_kbps": enc.get("audio_bitrate_kbps"),
+                    },
+                }
+            )
+    normalized["show_profiles"] = normalized_profiles
+
+    jellyfin_cfg = normalized.get("jellyfin", {})
+    if not isinstance(jellyfin_cfg, dict):
+        jellyfin_cfg = {}
+    normalized["jellyfin"] = {
+        "enabled": bool(jellyfin_cfg.get("enabled", False)),
+        "base_url": str(jellyfin_cfg.get("base_url", "")).strip().rstrip("/"),
+        "api_key": str(jellyfin_cfg.get("api_key", "")).strip(),
+        "refresh_after_run": bool(jellyfin_cfg.get("refresh_after_run", True)),
+        "min_done_to_refresh": int(jellyfin_cfg.get("min_done_to_refresh", 1)),
+        "timeout_seconds": int(jellyfin_cfg.get("timeout_seconds", 10)),
+    }
     log_path = normalized["logging"].get("log_path")
     if log_path:
         normalized["logging"]["log_path"] = str(Path(log_path))
@@ -294,19 +358,37 @@ def build_loggers(config: dict[str, Any]) -> tuple[logging.Logger, JsonlLogger]:
     return logger, event_logger
 
 
-def hash_encoding_profile(config: dict[str, Any]) -> str:
-    profile = {
-        "codec": config["encoding"]["codec"],
-        "crf": config["encoding"]["crf"],
-        "preset": config["encoding"]["preset"],
-        "ten_bit": config["encoding"]["ten_bit"],
-        "container": config["encoding"]["container"],
-        "audio_codec": config["encoding"]["audio_codec"],
-        "audio_bitrate_kbps": config["encoding"]["audio_bitrate_kbps"],
-        "concurrency": config["encoding"]["concurrency"],
-    }
+def hash_encoding_options(profile: dict[str, Any]) -> str:
     serialized = json.dumps(profile, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def resolve_encoding_for_show(config: dict[str, Any], show_name: str) -> tuple[dict[str, Any], str | None]:
+    effective = copy.deepcopy(config["encoding"])
+    matched = None
+    for profile in config.get("show_profiles", []):
+        pattern = str(profile.get("match", "")).strip()
+        if not pattern:
+            continue
+        if not fnmatch.fnmatch(show_name.lower(), pattern.lower()):
+            continue
+        matched = pattern
+        enc = profile.get("encoding", {})
+        if not isinstance(enc, dict):
+            break
+        if enc.get("crf") is not None:
+            effective["crf"] = int(enc["crf"])
+        if enc.get("preset") is not None:
+            effective["preset"] = int(enc["preset"])
+        if enc.get("ten_bit") is not None:
+            effective["ten_bit"] = bool(enc["ten_bit"])
+        if enc.get("audio_codec") in {"aac", "opus"}:
+            effective["audio_codec"] = enc["audio_codec"]
+        if enc.get("audio_bitrate_kbps") is not None:
+            effective["audio_bitrate_kbps"] = int(enc["audio_bitrate_kbps"])
+        break
+
+    return effective, matched
 
 
 def check_binaries(dry_run: bool, logger: logging.Logger, events: JsonlLogger) -> bool:
@@ -509,6 +591,17 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
     show_dirs = [p for p in sorted(input_root.iterdir(), key=lambda x: x.name.lower()) if p.is_dir()]
     for show_dir in show_dirs:
         show_name = show_dir.name
+        show_encoding, matched_profile = resolve_encoding_for_show(config, show_name)
+        show_profile_hash = hash_encoding_options(show_encoding)
+        if matched_profile:
+            logger.info("Show profile matched: %s -> %s", show_name, matched_profile)
+            events.emit(
+                level="info",
+                stage="scan",
+                message="show_profile_match",
+                show=show_name,
+                profile=matched_profile,
+            )
         season_dirs = [
             p
             for p in sorted(show_dir.iterdir(), key=lambda x: x.name.lower())
@@ -533,6 +626,7 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
                         season_name=season_name,
                         output_final_path=str(output_season / output_name),
                         output_temp_path=str(output_season / f"{output_name}{temp_suffix}"),
+                        ffmpeg_profile_hash=show_profile_hash,
                         input_size_bytes=stat.st_size,
                         input_mtime=stat.st_mtime,
                     )
@@ -549,7 +643,7 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
     return planned
 
 
-def upsert_planned_jobs(conn: sqlite3.Connection, jobs: list[PlannedJob], profile_hash: str) -> int:
+def upsert_planned_jobs(conn: sqlite3.Connection, jobs: list[PlannedJob]) -> int:
     statement = """
     INSERT INTO jobs (
         input_path, show_name, season_name, output_final_path, output_temp_path,
@@ -571,7 +665,7 @@ def upsert_planned_jobs(conn: sqlite3.Connection, jobs: list[PlannedJob], profil
             job.season_name,
             job.output_final_path,
             job.output_temp_path,
-            profile_hash,
+            job.ffmpeg_profile_hash,
             job.input_size_bytes,
             job.input_mtime,
         )
@@ -676,6 +770,73 @@ def collect_top_failure_reasons(conn: sqlite3.Connection, limit: int = 5) -> lis
     return ordered[:limit]
 
 
+def trigger_jellyfin_refresh(
+    config: dict[str, Any],
+    summary: Summary,
+    logger: logging.Logger,
+    events: JsonlLogger,
+) -> None:
+    jellyfin = config.get("jellyfin", {})
+    if not jellyfin.get("enabled", False):
+        return
+    if not jellyfin.get("refresh_after_run", True):
+        return
+    min_done = int(jellyfin.get("min_done_to_refresh", 1))
+    if summary.done < min_done:
+        return
+
+    base_url = str(jellyfin.get("base_url", "")).strip().rstrip("/")
+    api_key = str(jellyfin.get("api_key", "")).strip()
+    if not base_url or not api_key:
+        logger.warning("Jellyfin refresh skipped: missing base_url or api_key")
+        events.emit(
+            level="warning",
+            stage="jellyfin",
+            message="refresh_skipped_missing_config",
+        )
+        return
+
+    summary.jellyfin_refresh_attempted = True
+    url = f"{base_url}/Library/Refresh"
+    timeout_seconds = int(jellyfin.get("timeout_seconds", 10))
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "X-Emby-Token": api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            if 200 <= resp.status < 300:
+                summary.jellyfin_refresh_success = True
+                logger.info("Jellyfin library refresh triggered successfully")
+                events.emit(
+                    level="info",
+                    stage="jellyfin",
+                    message="refresh_triggered",
+                    status=resp.status,
+                )
+                return
+            logger.warning("Jellyfin refresh returned status %s", resp.status)
+            events.emit(
+                level="warning",
+                stage="jellyfin",
+                message="refresh_http_status",
+                status=resp.status,
+            )
+    except urllib.error.URLError as exc:
+        logger.warning("Jellyfin refresh failed: %s", exc)
+        events.emit(
+            level="warning",
+            stage="jellyfin",
+            message="refresh_failed",
+            error=str(exc),
+        )
+
+
 def cleanup_empty_staging_folders(
     config: dict[str, Any],
     summary: Summary,
@@ -737,6 +898,56 @@ def cleanup_empty_staging_folders(
         )
 
 
+def quarantine_file(
+    source_path: Path,
+    quarantine_root: str | None,
+    row: sqlite3.Row,
+    *,
+    kind: str,
+    summary: Summary,
+    logger: logging.Logger,
+    events: JsonlLogger,
+) -> Path | None:
+    if not quarantine_root or not source_path.exists():
+        return None
+
+    target_dir = (
+        Path(quarantine_root)
+        / sanitize_component(str(row["show_name"]))
+        / sanitize_component(str(row["season_name"]))
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / source_path.name
+    if target_path.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        target_path = target_dir / f"{target_path.stem}.{stamp}{target_path.suffix}"
+    try:
+        moved_to = Path(shutil.move(str(source_path), str(target_path)))
+        if kind == "input":
+            summary.quarantined_inputs += 1
+        elif kind == "final":
+            summary.quarantined_finals += 1
+        logger.warning("Quarantined %s file: %s -> %s", kind, source_path, moved_to)
+        events.emit(
+            level="warning",
+            stage="quarantine",
+            message=f"{kind}_quarantined",
+            source=str(source_path),
+            target=str(moved_to),
+        )
+        return moved_to
+    except OSError as exc:
+        logger.warning("Failed to quarantine %s file %s: %s", kind, source_path, exc)
+        events.emit(
+            level="warning",
+            stage="quarantine",
+            message=f"{kind}_quarantine_failed",
+            source=str(source_path),
+            error=str(exc),
+        )
+        return None
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -788,7 +999,7 @@ def mark_job_done(conn: sqlite3.Connection, input_path: str, output_size_bytes: 
     conn.commit()
 
 
-def build_ffmpeg_command(config: dict[str, Any], input_path: Path, temp_output_path: Path) -> list[str]:
+def build_ffmpeg_command(encoding: dict[str, Any], input_path: Path, temp_output_path: Path) -> list[str]:
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -802,25 +1013,25 @@ def build_ffmpeg_command(config: dict[str, Any], input_path: Path, temp_output_p
         "-map",
         "0:s?",
         "-c:v",
-        str(config["encoding"]["codec"]),
+        str(encoding["codec"]),
         "-crf",
-        str(config["encoding"]["crf"]),
+        str(encoding["crf"]),
         "-preset",
-        str(config["encoding"]["preset"]),
+        str(encoding["preset"]),
     ]
-    if config["encoding"]["ten_bit"]:
+    if encoding["ten_bit"]:
         cmd.extend(["-pix_fmt", "yuv420p10le"])
-    audio_codec = config["encoding"]["audio_codec"]
-    audio_bitrate = int(config["encoding"]["audio_bitrate_kbps"])
+    audio_codec = encoding["audio_codec"]
+    audio_bitrate = int(encoding["audio_bitrate_kbps"])
     if audio_codec == "aac":
         cmd.extend(["-c:a", "aac", "-b:a", f"{audio_bitrate}k"])
     else:
         cmd.extend(["-c:a", "libopus", "-b:a", f"{audio_bitrate}k"])
-    if config["encoding"]["container"] == "mkv":
+    if encoding["container"] == "mkv":
         cmd.extend(["-c:s", "copy"])
     else:
         cmd.extend(["-c:s", "mov_text"])
-    muxer = "matroska" if config["encoding"]["container"] == "mkv" else "mp4"
+    muxer = "matroska" if encoding["container"] == "mkv" else "mp4"
     cmd.extend(["-f", muxer])
     cmd.append(str(temp_output_path))
     return cmd
@@ -953,6 +1164,16 @@ def reconcile_job_from_existing_final(
             final_path.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Failed to delete bad final %s: %s", final_path, exc)
+    else:
+        quarantine_file(
+            final_path,
+            config["safety"].get("quarantine_failed_finals_root"),
+            row,
+            kind="final",
+            summary=summary,
+            logger=logger,
+            events=events,
+        )
     return True
 
 
@@ -967,6 +1188,7 @@ def run_encode_for_job(
     input_path = Path(row["input_path"])
     final_path = Path(row["output_final_path"])
     temp_path = Path(row["output_temp_path"])
+    encoding, matched_profile = resolve_encoding_for_show(config, str(row["show_name"]))
     if not input_path.is_file():
         mark_job_failed(conn, row["input_path"], "input file missing")
         summary.failed += 1
@@ -980,15 +1202,31 @@ def run_encode_for_job(
         row["input_path"],
         {"status": "encoding", "started_at": utc_now(), "last_error": None},
     )
-    cmd = build_ffmpeg_command(config, input_path, temp_path)
+    cmd = build_ffmpeg_command(encoding, input_path, temp_path)
     logger.info("Encoding: %s", input_path)
-    events.emit(level="info", stage="encoding", message="encode_start", input=row["input_path"])
+    events.emit(
+        level="info",
+        stage="encoding",
+        message="encode_start",
+        input=row["input_path"],
+        show=row["show_name"],
+        profile=matched_profile,
+    )
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0 or not temp_path.exists():
         detail = proc.stderr.strip() or proc.stdout.strip() or f"ffmpeg exit code {proc.returncode}"
         mark_job_failed(conn, row["input_path"], f"encode failed: {detail}")
         summary.failed += 1
         logger.warning("Encode failed for %s: %s", input_path, detail)
+        quarantine_file(
+            input_path,
+            config["safety"].get("quarantine_failed_inputs_root"),
+            row,
+            kind="input",
+            summary=summary,
+            logger=logger,
+            events=events,
+        )
         temp_path.unlink(missing_ok=True)
         return
 
@@ -1009,6 +1247,16 @@ def run_encode_for_job(
         logger.warning("Final verification failed for %s: %s", final_path, final_error)
         if config["safety"]["delete_bad_final"]:
             final_path.unlink(missing_ok=True)
+        else:
+            quarantine_file(
+                final_path,
+                config["safety"].get("quarantine_failed_finals_root"),
+                row,
+                kind="final",
+                summary=summary,
+                logger=logger,
+                events=events,
+            )
         return
 
     mark_job_done(conn, row["input_path"], final_size, probe_json)
@@ -1088,8 +1336,12 @@ def print_summary(summary: Summary, logger: logging.Logger, events: JsonlLogger)
         "skipped": summary.skipped,
         "failed": summary.failed,
         "deleted_originals": summary.deleted_originals,
+        "quarantined_inputs": summary.quarantined_inputs,
+        "quarantined_finals": summary.quarantined_finals,
         "deleted_season_folders": summary.deleted_season_folders,
         "deleted_show_folders": summary.deleted_show_folders,
+        "jellyfin_refresh_attempted": summary.jellyfin_refresh_attempted,
+        "jellyfin_refresh_success": summary.jellyfin_refresh_success,
         "top_failure_reasons": top_reasons,
     }
     logger.info("Run summary: %s", payload)
@@ -1115,7 +1367,7 @@ def main() -> int:
     logger, events = build_loggers(config)
     summary = Summary()
     try:
-        logger.info("Starting LibriEncode Phase 3 run")
+        logger.info("Starting LibriEncode Phase 4 run")
         events.emit(level="info", stage="startup", message="run_start", dry_run=config["dry_run"])
         if not check_binaries(config["dry_run"], logger, events):
             return 3
@@ -1137,11 +1389,12 @@ def main() -> int:
         conn.row_factory = sqlite3.Row
         try:
             ensure_state_schema(conn)
-            summary.db_upserts = upsert_planned_jobs(conn, planned_jobs, hash_encoding_profile(config))
+            summary.db_upserts = upsert_planned_jobs(conn, planned_jobs)
             run_startup_recovery(conn, config, summary, logger, events)
             process_jobs(conn, config, planned_jobs, summary, logger, events)
             cleanup_empty_staging_folders(config, summary, logger, events)
             summary.top_failure_reasons = collect_top_failure_reasons(conn)
+            trigger_jellyfin_refresh(config, summary, logger, events)
         finally:
             conn.close()
 
