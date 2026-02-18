@@ -25,8 +25,8 @@ except ImportError:
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "input_root": "A:/mnt/Extreme500/Anime/_incoming",
-    "output_root": "A:/mnt/Extreme500/Anime",
+    "input_root": "./data/incoming",
+    "output_root": "./data/library",
     "state_db": None,
     "scan": {
         "season_folder_glob": "Season *",
@@ -46,6 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_attempts": 3,
         "delete_bad_final": False,
         "temp_suffix": ".tmp",
+        "delete_leftover_temp_on_start": True,
         "min_output_bytes": 5000000,
         "duration_tolerance_seconds": 3.0,
     },
@@ -87,12 +88,15 @@ class Summary:
     discovered_files: int = 0
     planned_jobs: int = 0
     db_upserts: int = 0
+    recovered_jobs: int = 0
+    deleted_temp_files: int = 0
     done: int = 0
     skipped: int = 0
     failed: int = 0
     deleted_originals: int = 0
     deleted_season_folders: int = 0
     deleted_show_folders: int = 0
+    top_failure_reasons: list[tuple[str, int]] | None = None
 
 
 class JsonlLogger:
@@ -136,7 +140,7 @@ class JsonlLogger:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="libriencode",
-        description="Safe AV1 library encoder (Phase 2).",
+        description="Safe AV1 library encoder (Phase 3).",
     )
     parser.add_argument("--config", type=str, help="Path to YAML config file.")
     parser.add_argument("--input-root", type=str)
@@ -242,6 +246,9 @@ def normalize_config(config: dict[str, Any], *, dry_run: bool) -> dict[str, Any]
     normalized["safety"]["max_attempts"] = int(normalized["safety"].get("max_attempts", 3))
     normalized["safety"]["delete_bad_final"] = bool(normalized["safety"].get("delete_bad_final", False))
     normalized["safety"]["temp_suffix"] = str(normalized["safety"].get("temp_suffix", ".tmp"))
+    normalized["safety"]["delete_leftover_temp_on_start"] = bool(
+        normalized["safety"].get("delete_leftover_temp_on_start", True)
+    )
     normalized["safety"]["min_output_bytes"] = int(normalized["safety"].get("min_output_bytes", 5000000))
     normalized["safety"]["duration_tolerance_seconds"] = float(
         normalized["safety"].get("duration_tolerance_seconds", 3.0)
@@ -592,6 +599,144 @@ def emit_dry_run_plan(jobs: list[PlannedJob], logger: logging.Logger, events: Js
         )
 
 
+def run_startup_recovery(
+    conn: sqlite3.Connection,
+    config: dict[str, Any],
+    summary: Summary,
+    logger: logging.Logger,
+    events: JsonlLogger,
+) -> None:
+    delete_temp_on_start = bool(config["safety"]["delete_leftover_temp_on_start"])
+    if delete_temp_on_start:
+        rows = conn.execute(
+            "SELECT output_temp_path FROM jobs WHERE status != 'done'"
+        ).fetchall()
+        for row in rows:
+            temp_path = Path(row["output_temp_path"])
+            if not temp_path.is_file():
+                continue
+            try:
+                temp_path.unlink()
+                summary.deleted_temp_files += 1
+                events.emit(
+                    level="info",
+                    stage="startup_recovery",
+                    message="leftover_temp_deleted",
+                    temp_path=str(temp_path),
+                )
+            except OSError as exc:
+                logger.warning("Failed to delete leftover temp %s: %s", temp_path, exc)
+                events.emit(
+                    level="warning",
+                    stage="startup_recovery",
+                    message="leftover_temp_delete_failed",
+                    temp_path=str(temp_path),
+                    error=str(exc),
+                )
+
+    reset_count = conn.execute(
+        """
+        UPDATE jobs
+        SET status = 'pending', last_error = COALESCE(last_error, 'reset on startup')
+        WHERE status IN ('encoding', 'verifying')
+        """
+    ).rowcount
+    conn.commit()
+    summary.recovered_jobs += int(reset_count or 0)
+    if summary.recovered_jobs or summary.deleted_temp_files:
+        logger.info(
+            "Startup recovery: reset %d in-progress jobs, deleted %d temp files",
+            summary.recovered_jobs,
+            summary.deleted_temp_files,
+        )
+        events.emit(
+            level="info",
+            stage="startup_recovery",
+            message="startup_recovery_complete",
+            recovered_jobs=summary.recovered_jobs,
+            deleted_temp_files=summary.deleted_temp_files,
+        )
+
+
+def collect_top_failure_reasons(conn: sqlite3.Connection, limit: int = 5) -> list[tuple[str, int]]:
+    rows = conn.execute(
+        """
+        SELECT last_error
+        FROM jobs
+        WHERE status = 'failed' AND last_error IS NOT NULL AND last_error != ''
+        """
+    ).fetchall()
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = str(row["last_error"]).splitlines()[0].strip()
+        if not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    ordered = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return ordered[:limit]
+
+
+def cleanup_empty_staging_folders(
+    config: dict[str, Any],
+    summary: Summary,
+    logger: logging.Logger,
+    events: JsonlLogger,
+) -> None:
+    input_root = Path(config["input_root"])
+    season_glob = str(config["scan"]["season_folder_glob"])
+    if not input_root.is_dir():
+        return
+
+    show_dirs = [p for p in sorted(input_root.iterdir(), key=lambda x: x.name.lower()) if p.is_dir()]
+    for show_dir in show_dirs:
+        season_dirs = [
+            p
+            for p in sorted(show_dir.iterdir(), key=lambda x: x.name.lower())
+            if p.is_dir() and fnmatch.fnmatch(p.name, season_glob)
+        ]
+        for season_dir in season_dirs:
+            try:
+                next(season_dir.iterdir())
+            except StopIteration:
+                try:
+                    season_dir.rmdir()
+                    summary.deleted_season_folders += 1
+                    events.emit(
+                        level="info",
+                        stage="cleanup",
+                        message="deleted_empty_season_folder",
+                        path=str(season_dir),
+                    )
+                except OSError:
+                    pass
+            except OSError:
+                continue
+
+        try:
+            next(show_dir.iterdir())
+        except StopIteration:
+            try:
+                show_dir.rmdir()
+                summary.deleted_show_folders += 1
+                events.emit(
+                    level="info",
+                    stage="cleanup",
+                    message="deleted_empty_show_folder",
+                    path=str(show_dir),
+                )
+            except OSError:
+                pass
+        except OSError:
+            continue
+
+    if summary.deleted_season_folders or summary.deleted_show_folders:
+        logger.info(
+            "Cleanup: deleted %d empty season folders and %d empty show folders",
+            summary.deleted_season_folders,
+            summary.deleted_show_folders,
+        )
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -887,7 +1032,7 @@ def process_jobs(
 ) -> None:
     max_attempts = int(config["safety"]["max_attempts"])
     if int(config["encoding"]["concurrency"]) > 1:
-        logger.info("Concurrency %d requested; executing sequentially in Phase 2.", int(config["encoding"]["concurrency"]))
+        logger.info("Concurrency %d requested; current runner executes sequentially.", int(config["encoding"]["concurrency"]))
 
     for job in jobs:
         row = fetch_job_row(conn, job.input_path)
@@ -933,15 +1078,19 @@ def process_jobs(
 
 
 def print_summary(summary: Summary, logger: logging.Logger, events: JsonlLogger) -> None:
+    top_reasons = summary.top_failure_reasons or []
     payload = {
         "planned_jobs": summary.planned_jobs,
         "db_upserts": summary.db_upserts,
+        "recovered_jobs": summary.recovered_jobs,
+        "deleted_temp_files": summary.deleted_temp_files,
         "done": summary.done,
         "skipped": summary.skipped,
         "failed": summary.failed,
         "deleted_originals": summary.deleted_originals,
         "deleted_season_folders": summary.deleted_season_folders,
         "deleted_show_folders": summary.deleted_show_folders,
+        "top_failure_reasons": top_reasons,
     }
     logger.info("Run summary: %s", payload)
     events.emit(level="info", stage="summary", message="run_summary", **payload)
@@ -966,7 +1115,7 @@ def main() -> int:
     logger, events = build_loggers(config)
     summary = Summary()
     try:
-        logger.info("Starting LibriEncode Phase 2 run")
+        logger.info("Starting LibriEncode Phase 3 run")
         events.emit(level="info", stage="startup", message="run_start", dry_run=config["dry_run"])
         if not check_binaries(config["dry_run"], logger, events):
             return 3
@@ -989,7 +1138,10 @@ def main() -> int:
         try:
             ensure_state_schema(conn)
             summary.db_upserts = upsert_planned_jobs(conn, planned_jobs, hash_encoding_profile(config))
+            run_startup_recovery(conn, config, summary, logger, events)
             process_jobs(conn, config, planned_jobs, summary, logger, events)
+            cleanup_empty_staging_folders(config, summary, logger, events)
+            summary.top_failure_reasons = collect_top_failure_reasons(conn)
         finally:
             conn.close()
 
