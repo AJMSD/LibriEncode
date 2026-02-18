@@ -1,6 +1,6 @@
-input_root: "A:/mnt/Extreme500/Anime/_incoming"
-output_root: "A:/mnt/Extreme500/Anime"
-state_db: "A:/mnt/Extreme500/Anime/.av1-encode-state.sqlite"
+input_root: "./data/incoming"
+output_root: "./data/library"
+state_db: "./data/library/.av1-encode-state.sqlite"
 
 scan:
   season_folder_glob: "Season *"
