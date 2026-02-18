@@ -7,21 +7,19 @@ LibriEncode is a safety-first tool that prepares your TV episodes for AV1 encodi
 - Plan where each encoded file should go in your library.
 - Track progress in a local SQLite database so reruns are safe.
 - Encode to AV1, verify output, and only then delete originals.
+- Recover cleanly after interruptions by resetting in-progress jobs and removing leftover temp files.
+- Remove empty staging season/show folders after successful processing.
 
-Phase 2 adds real encoding, verification, atomic finalize, and safe delete rules.
+Phase 3 adds startup recovery, empty folder cleanup, and stronger end-of-run reporting.
 
 ## Current Progress
 - Phase 1: Completed on `2026-02-18`
 - Phase 2: Completed on `2026-02-18`
-- Phase 3: Not started
-
-Detailed tracking lives in `CHECKLIST.md`.
+- Phase 3: Completed on `2026-02-18`
 
 ## Simple Project Layout
 - `libriencode.py`: main script (single-file implementation)
 - `config.example.yaml`: example configuration
-- `CHECKLIST.md`: phase-by-phase execution tracker
-- `PRD.md`: product requirements source
 
 ## Requirements
 - Python 3.10+
@@ -66,6 +64,7 @@ What happens:
 - Marks DB state as `done`
 - Deletes source only after `done`
 - Keeps bad/corrupt inputs and continues
+- Removes empty staging season/show folders when possible
 
 ## Common CLI Overrides
 
@@ -85,13 +84,16 @@ You can override config values at runtime for:
 - Optional JSON events: enabled via `--json-logs` or config
 - State DB default: `output_root/.av1-encode-state.sqlite`
 - Per-file statuses: `pending`, `encoding`, `verifying`, `done`, `failed`, `skipped`
+- Startup recovery: lingering temp files are removed and `encoding`/`verifying` rows are reset to `pending`
+- End summary includes top failure reasons
 
 ## Safety Notes
 - Source files are deleted only after successful encode + verify + state commit.
 - Final files are published via atomic rename from temp to final path.
 - Existing final files are reconciled before re-encoding.
 - Corrupt files are marked failed and kept in staging.
+- Empty staging season/show folders are removed only when actually empty.
 - `--dry-run` avoids persistent writes.
 
 ## Next
-Phase 3 will add startup temp cleanup, empty staging folder cleanup, and full acceptance hardening.
+Future work can focus on metrics, scheduling docs, and optional metadata enhancements.
