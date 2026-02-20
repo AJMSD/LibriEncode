@@ -27,7 +27,7 @@ Install dependency:
 pip install pyyaml
 ```
 
-## Quick Start (Layman Friendly)
+## Quick Start
 1. Copy `config.example.yaml` to your own config file (for example `config.yaml`).
 2. Edit folder paths (`input_root`, `output_root`) to match your machine.
 3. Run a dry run first to see what will be processed.
