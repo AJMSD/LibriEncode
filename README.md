@@ -53,6 +53,7 @@ python libriencode.py --config config.yaml
 
 What happens:
 - Scans and plans work
+- Builds strict output filenames as `<Show> SXXE...` (no source-title suffix)
 - Encodes each file to a temp output
 - Verifies output with `ffprobe` (AV1 codec + duration check + minimum size)
 - Atomically renames temp to final file
@@ -78,6 +79,13 @@ You can override config values at runtime for:
   - `safety.quarantine_failed_inputs_root` / `safety.quarantine_failed_finals_root`
   - `safety.progress_stall_timeout_seconds` to stop a stuck ffmpeg process (set `0` to disable)
   - `jellyfin.enabled`, `jellyfin.base_url`, `jellyfin.api_key`
+
+## Naming Rules
+- Final output name format is strict: `<Show> S{season:02d}E{episode_token}.{container}`.
+- Season numbers are parsed from season folder names with unlimited digits (for example, `Season 100` -> `S100`).
+- Episode numbers are parsed with unlimited digits (for example, `Episode 10000` -> `E10000`).
+- Fractional episodes use `p` notation (for example, `Episode 1061.5` -> `E1061p5`).
+- If season/episode parsing fails, the file is skipped during planning and a warning is logged.
 
 ## Logs and State
 - Human logs: console + optional file (`logging.log_path`)

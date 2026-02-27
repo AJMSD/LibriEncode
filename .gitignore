@@ -1,3 +1,5 @@
 CHECKLIST.md
 PRD.md
 __pycache__/
+logs/
+config.yaml
