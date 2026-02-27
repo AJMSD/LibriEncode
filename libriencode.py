@@ -80,10 +80,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 VALID_STATUSES = {"pending", "encoding", "verifying", "done", "failed", "skipped"}
 BINARY_NAMES = ("ffmpeg", "ffprobe")
-SEASON_NUMBER_RE = re.compile(r"season\s*(\d{1,2})", re.IGNORECASE)
-SXXEYY_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})")
-EPISODE_RE = re.compile(r"(?:episode|ep)\s*[-_. ]*(\d{1,3})", re.IGNORECASE)
-DASH_NUMBER_RE = re.compile(r"(?:^|[\s_.-])-\s*(\d{1,3})(?:[\s_.-]|$)")
+SEASON_NUMBER_RE = re.compile(r"season\s*(\d+)", re.IGNORECASE)
+SXXEYY_RE = re.compile(r"[Ss](\d+)[Ee](\d+(?:\.\d+)?)")
+EPISODE_RE = re.compile(r"(?:episode|ep)\s*[-_. ]*(\d+(?:\.\d+)?)", re.IGNORECASE)
+DASH_NUMBER_RE = re.compile(r"(?:^|[\s_.-])-\s*(\d+(?:\.\d+)?)(?:[\s_.-]|$)")
 NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 
 
@@ -576,24 +576,38 @@ def parse_season_number(season_name: str) -> int | None:
     return int(match.group(1))
 
 
-def extract_episode_number(stem: str) -> int | None:
+def normalize_episode_token(raw_episode: str) -> str | None:
+    value = raw_episode.strip()
+    if not value:
+        return None
+    if "." in value:
+        major_raw, minor_raw = value.split(".", 1)
+        if not major_raw.isdigit() or not minor_raw.isdigit():
+            return None
+        major = int(major_raw)
+        minor = minor_raw.rstrip("0")
+        if not minor:
+            return f"{major:02d}"
+        return f"{major:02d}p{minor}"
+    if not value.isdigit():
+        return None
+    return f"{int(value):02d}"
+
+
+def extract_episode_token(stem: str) -> str | None:
     sxxeyy = SXXEYY_RE.search(stem)
     if sxxeyy:
-        return int(sxxeyy.group(2))
+        return normalize_episode_token(sxxeyy.group(2))
     for pattern in (EPISODE_RE, DASH_NUMBER_RE):
         match = pattern.search(stem)
         if match:
-            return int(match.group(1))
+            return normalize_episode_token(match.group(1))
     return None
 
 
-def build_output_basename(show_name: str, season_name: str, source_stem: str) -> str:
-    episode_number = extract_episode_number(source_stem)
-    season_number = parse_season_number(season_name)
-    if episode_number is not None and season_number is not None:
-        composed = f"{show_name} S{season_number:02d}E{episode_number:02d} {source_stem}"
-        return sanitize_component(composed)
-    return sanitize_component(source_stem)
+def build_output_basename(show_component: str, season_number: int, episode_token: str) -> str:
+    composed = f"{show_component} S{season_number:02d}E{episode_token}"
+    return sanitize_component(composed)
 
 
 def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlLogger) -> list[PlannedJob]:
@@ -604,10 +618,12 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
     target_extension = f".{config['encoding']['container'].lstrip('.')}"
     temp_suffix = config["safety"]["temp_suffix"]
     planned: list[PlannedJob] = []
+    skipped_naming = 0
 
     show_dirs = [p for p in sorted(input_root.iterdir(), key=lambda x: natural_sort_key(x.name)) if p.is_dir()]
     for show_dir in show_dirs:
         show_name = show_dir.name
+        output_show_name = sanitize_component(show_name)
         show_encoding, matched_profile = resolve_encoding_for_show(config, show_name)
         show_profile_hash = hash_encoding_options(show_encoding)
         if matched_profile:
@@ -626,14 +642,47 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
         ]
         for season_dir in season_dirs:
             season_name = season_dir.name
+            output_season_name = sanitize_component(season_name)
+            output_season = output_root / output_show_name / output_season_name
+            season_number = parse_season_number(output_season_name)
             files = [
                 p
                 for p in sorted(season_dir.iterdir(), key=lambda x: natural_sort_key(x.name))
                 if p.is_file() and p.suffix.lower() in extension_set
             ]
             for source in files:
-                output_season = output_root / sanitize_component(show_name) / sanitize_component(season_name)
-                output_stem = build_output_basename(show_name, season_name, source.stem)
+                if season_number is None:
+                    skipped_naming += 1
+                    reason = f"season number parse failed for '{season_name}'"
+                    logger.warning("Skipping file due to naming parse failure: %s (%s)", source, reason)
+                    events.emit(
+                        level="warning",
+                        stage="scan",
+                        message="naming_parse_failed",
+                        input=str(source),
+                        show=show_name,
+                        season=season_name,
+                        reason=reason,
+                    )
+                    continue
+
+                episode_token = extract_episode_token(source.stem)
+                if episode_token is None:
+                    skipped_naming += 1
+                    reason = f"episode number parse failed for '{source.stem}'"
+                    logger.warning("Skipping file due to naming parse failure: %s (%s)", source, reason)
+                    events.emit(
+                        level="warning",
+                        stage="scan",
+                        message="naming_parse_failed",
+                        input=str(source),
+                        show=show_name,
+                        season=season_name,
+                        reason=reason,
+                    )
+                    continue
+
+                output_stem = build_output_basename(output_show_name, season_number, episode_token)
                 output_name = f"{output_stem}{target_extension}"
                 stat = source.stat()
                 planned.append(
@@ -648,12 +697,21 @@ def scan_and_plan(config: dict[str, Any], logger: logging.Logger, events: JsonlL
                         input_mtime=stat.st_mtime,
                     )
                 )
+    if skipped_naming:
+        logger.warning("Skipped %d files due to naming parse failures", skipped_naming)
+        events.emit(
+            level="warning",
+            stage="scan",
+            message="naming_parse_skipped_total",
+            skipped_files=skipped_naming,
+        )
     logger.info("Discovered %d encode-eligible files", len(planned))
     events.emit(
         level="info",
         stage="scan",
         message="scan_complete",
         planned_jobs=len(planned),
+        skipped_naming=skipped_naming,
         season_glob=season_glob,
         extensions=sorted(extension_set),
     )
